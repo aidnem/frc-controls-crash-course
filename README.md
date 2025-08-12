@@ -1,3 +1,3 @@
 # frc-controls-crash-course
-My attempt to make a crash course in FRC programming. This is very specialized to the way 401 does things.
+Some exercises and resources to learn FRC programming. This is intended as a quick intro to help new members learn by doing.
 
