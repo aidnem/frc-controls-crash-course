@@ -1,21 +1,19 @@
 # Elevator
 An elevator is a simple mechanism that moves something up or down. This lesson will introduce some basic concepts in controls by helping you through programming an elevator.
 
----
-
 ## Why an Elevator?
 
 Controlling elevators is simple because they have only one degree of freedom and are remarkably consistent. The same amount of power applied to a motor should almost always produce the exact same motion from the elevator.
 
 This makes them easier to control compared to something like an arm, where the force of gravity changes depending on the angle of the arm (imagine hanging your arm straight down vs. horizontal, parallel to the ground: more force is needed to maintain the angle when your arm is horizontal).
 
----
-
 ## How to use this guide
 
 This guide is intended to provide step-by-step help on the basics of writing a subsystem for FRC. Learning by doing is a great strategy, especially for FRC when combined with googling words as they come up. To aid in learning by doing, this guide tries to serve as a reference that can guide a new FRC programmer through the process, while taking detours to give quick explanations on terms that may be unfamiliar. 95% of this guide can be figured out by googling, looking at existing FRC code, and experimentation, but that can be daunting.
 
 While this guide contains code snippets, it is *strongly encouraged* not to copy and paste them into your robot project: you will learn better by typing the code yourself, by gaining muscle memory, understanding the code better as you write it, and having to go back and fix errors that may appear from typing mistakes. In addition, some of the code in the guide may contain errors; nobody is perfect. If something doesn't work, try to fix it youself. If you do find an obvious mistake, feel free to open an issue on GitHub to fix it.
+
+## Writing the Elevator IO
 
 1. First, install the required software. Good instructions on this can be found in [zero to robot](https://docs.wpilib.org/en/stable/docs/zero-to-robot/step-2/index.html). For java programming, you will need to [install the game tools](https://docs.wpilib.org/en/stable/docs/zero-to-robot/step-2/frc-game-tools.html) and then [install WPILib](https://docs.wpilib.org/en/stable/docs/zero-to-robot/step-2/wpilib-setup.html).
 	<br>
@@ -88,10 +86,10 @@ While this guide contains code snippets, it is *strongly encouraged* not to copy
 	  * <p>This method should only be called by the ElevatorSubsystem! There is important safety
 	  * control logic housed there which, if bypassed, will be sorely missed.
 	  */
-	public void setLargeCANCoderGoalPos(Angle goalPos);
+	public void setElevatorEncoderGoalPos(Angle goalPos);
 	
 	/** Get the absolute position of the 19 tooth CANCoder. */
-	public Angle getLargeCANCoderAbsPos();
+	public Angle getElevatorEncoderAbsPos();
 	
 	/** Get the absolute position of the 17 tooth CANCoder. */
 	public Angle getSmallCANCoderAbsPos();
@@ -100,7 +98,7 @@ While this guide contains code snippets, it is *strongly encouraged* not to copy
 	  * Set the position of the 19 tooth CANCoder. This position is separate from absolute position and
 	  * can track multiple rotations.
 	  */
-	public void setLargeCANCoderPosition(Angle newAngle);
+	public void setElevatorEncoderPosition(Angle newAngle);
 	
 	/**
 	  * Set the position of the 17 tooth CANCoder. This position is separate from absolute position and
@@ -149,7 +147,7 @@ While this guide contains code snippets, it is *strongly encouraged* not to copy
 	public void setMotorsDisabled(boolean disabled);
 	```
 	
-	You will notice that most of the values aren't doubles; we use the [WPILib Units library](https://docs.wpilib.org/en/stable/docs/software/basic-programming/java-units.html). This allows us to keep track of what unit values are, instead of having to name every variable with the unit that it is in. For instance, a method taking an argument with type `Distance` can accept both `Meters.of(1.0)` and `Inches.of(12.0)`, and both will be handled correctly.
+	You will notice that most of the values aren't doubles; we use the [WPILib Units library](https://docs.wpilib.org/en/stable/docs/software/basic-programming/java-units.html). This allows us to keep track of what units are associated with values, instead of having to name every variable with the unit that it is in. For instance, a method taking an argument with type `Distance` can accept both `Meters.of(1.0)` and `Inches.of(12.0)`, and both will be handled correctly.
 	<br>
 1. Define the ElevatorInputs class:
 	There are a few fields we want to track in our inputs:
@@ -242,10 +240,112 @@ While this guide contains code snippets, it is *strongly encouraged* not to copy
 
     ```java
     MutAngle encoderGoalAngle = Rotations.mutable(0.0);
-    
+
     MutVoltage overrideVoltage = Rotations.mutable(0.0);
     MutCurrent overrideCurrent = Amps.mutable(0.0);
 
     ElevatorOutputMode outputMode = ElevatorOutputMode.ClosedLoop;
+
+    boolean motorsDisabled = false;
     ```
 
+    Next, we need a handle to interact with each motor and the encoder. For motors, this is a `TalonFX` object, and for CANcoders the class is called `CANcoder`. We also add a local `TalonFXConfiguration` object, which will hold the motor config that we will apply. Finally, we can include the control requests that we will send to the motor. These are objects that describes what behavior we want the motor to follow. We have a request for the closed-loop, voltage, and current output modes.
+
+    ```java
+    TalonFX leadMotor; // This motor will control to the goal position
+    TalonFX followerMotor; // This motor will follow/copy the lead motor's commands
+
+    CANcoder elevatorEncoder;
+
+    // Reuse the same TalonFXConfiguration object to avoid creating new ones repeatedly and leaking memory
+    TalonFXConfiguration talonFXConfigs;
+
+    // Reuse the same requests to avoid the garbage collector having to clean up requests created every loop
+    MotionMagicExpoTorqueCurrentFOC closedLoopRequest = new MotionMagicExpoTorqueCurrentFOC(0.0);
+    VoltageOut voltageOut = new VoltageOut(0.0);
+    TorqueCurrentFOC currentOut = new TorqueCurrentFOC(0.0);
+    ```
+
+    `MotionMagicExpoTorqueCurrentFOC` is a crazy class name. Let's break it down:
+
+    - `MotionMagicExpo` - This means that the request uses Motion Magic Expo, a motion profile that runs on the TalonFX controller. Expo comes from the fact that it's an exponential motion profile, which you can read about [here](https://v6.docs.ctr-electronics.com/en/latest/docs/api-reference/device-specific/talonfx/motion-magic.html#motion-magic-expo).
+    - `TorqueCurrentFOC` - A TorqueCurrentFOC request uses [Field Oriented Control](https://en.wikipedia.org/wiki/Vector_control_(motor)), also called vector control. This produces a slightly stronger peak output than standard voltage control. The TorqueCurrent part comes from the fact that this control method is in terms of acceleration/current; rather than commanding the motor to apply a certain voltage/power, it is commanded directly in terms of acceleration.
+
+    Now that we've defined our member variables, we can write a constructor. As you write your constructor, add each Constant that you use to an ElevatorConstants.java file as public, final values. Separating your constants from your main code is helpful because it makes it much easier to find values to tweak during tuning. Additionally, CopperCore (Team 401's core software library) provides JSONSync, a way to load constants with JSON files, which means you won't have to re-compile your code whenever you change a value. To see how to use JSON-Sync, see [how they're defined in 2025's ElevatorConstants.java](https://github.com/team401/2025-Robot-Code/blob/78548d16519e17e819c804a9da722a5ba1254a08/src/main/java/frc/robot/constants/subsystems/ElevatorConstants.java), [how they're loaded in JsonConstants.java](https://github.com/team401/2025-Robot-Code/blob/78548d16519e17e819c804a9da722a5ba1254a08/src/main/java/frc/robot/constants/JsonConstants.java), and [how they're accessed in 2025's WristIOTalonFX.java](https://github.com/team401/2025-Robot-Code/blob/78548d16519e17e819c804a9da722a5ba1254a08/src/main/java/frc/robot/subsystems/scoring/WristIOTalonFX.java#L77). This guide will access the constants as JSON constants, but you can just access them as class member variables if your team elects not to use JSON constants from CopperCore.
+
+    ```java
+    public ElevatorIOTalonFX() {
+        // Initialize TalonFXs  and CANcoders with their correct IDs
+        leadMotor = new TalonFX(JsonConstants.elevatorConstants.leadElevatorMotorId, "canivore");
+        followerMotor =
+            new TalonFX(JsonConstants.elevatorConstants.followerElevatorMotorId, "canivore");
+
+        elevatorEncoder =
+            new CANcoder(JsonConstants.elevatorConstants.elevatorCANCoderID, "canivore");
+
+        CANcoderConfiguration cancoderConfiguration = new CANcoderConfiguration();
+        cancoderConfiguration.MagnetSensor.AbsoluteSensorDiscontinuityPoint =
+            JsonConstants.elevatorConstants.elevatorEncoderDiscontinuityPoint;
+
+        cancoderConfiguration.MagnetSensor.SensorDirection =
+            JsonConstants.elevatorConstants.elevatorElevatorEncoderDirection;
+        cancoderConfiguration.MagnetSensor.MagnetOffset = 0.0;
+        elevatorEncoder.getConfigurator().apply(cancoderConfiguration);
+
+        // Initialize talonFXConfigs to use FusedCANCoder and Motion Magic Expo and have correct PID
+        // gains and current limits.
+        talonFXConfigs =
+            new TalonFXConfiguration()
+            // These configs dictate how Closed-Loop control will be run on the motors:
+            .withFeedback(
+                    new FeedbackConfigs()
+                    // We set the elevator encoder as the "remote sensor". This means that the motor will listen to the current location of the elevator encoder as its position input for PID control
+                    .withFeedbackRemoteSensorID(elevatorEncoder.getDeviceID())
+                    // FusedCANCoder combines the encoder position and velocity with the readings from the internal encoder built into the motor; this provides faster and smoother control.
+                    .withFeedbackSensorSource(FeedbackSensorSourceValue.FusedCANcoder)
+                    // Tell the motor how many rotations of the encoder are equivalent to one rotation of the "mechanism"
+                    .withSensorToMechanismRatio(
+                        JsonConstants.elevatorConstants.elevatorEncoderToMechanismRatio)
+                    // This ratio tells the motor how many rotations of its internal rotor are equivalent to one rotation of the "elevator". This allows it to combine its inputs with the encoder's correctly with FusedCANCoder input.
+                    .withRotorToSensorRatio(
+                        JsonConstants.elevatorConstants.rotorToElevatorEncoderRatio))
+            // This config means that the motor will spin freely when no power is requested; the other option is Brake, which will resist any movement, and can be useful in many cases as well.
+            .withMotorOutput(new MotorOutputConfigs().withNeutralMode(NeutralModeValue.Coast))
+            .withCurrentLimits(
+                    new CurrentLimitsConfigs()
+                    .withStatorCurrentLimitEnable(true)
+                    // Current limits help to prevent overheating the motor and draining the battery.
+                    .withStatorCurrentLimit(
+                        JsonConstants.elevatorConstants.elevatorStatorCurrentLimit))
+            .withSlot0(
+                    // These Slot0Configs apply all of the gains for PID control as well as feedforward
+                    new Slot0Configs()
+                    .withGravityType(GravityTypeValue.Elevator_Static)
+                    .withKS(JsonConstants.elevatorConstants.elevatorkS)
+                    .withKV(JsonConstants.elevatorConstants.elevatorkV)
+                    .withKA(JsonConstants.elevatorConstants.elevatorkA)
+                    .withKG(JsonConstants.elevatorConstants.elevatorkG)
+                    .withKP(JsonConstants.elevatorConstants.elevatorkP)
+                    .withKI(JsonConstants.elevatorConstants.elevatorkI)
+                    .withKD(JsonConstants.elevatorConstants.elevatorkD))
+            .withMotionMagic(
+                    // This section of the config determines the maximum speed and acceleration, which MotionMagicExpo will use to generate a motion profile.
+                    new MotionMagicConfigs()
+                    .withMotionMagicCruiseVelocity(
+                        JsonConstants.elevatorConstants.elevatorAngularCruiseVelocity)
+                    .withMotionMagicExpo_kA(
+                        JsonConstants.elevatorConstants.elevatorExpo_kA_raw)
+                    .withMotionMagicExpo_kV(
+                        JsonConstants.elevatorConstants.elevatorExpo_kV_raw));
+
+        // Apply talonFX config to both motors
+        leadMotor.getConfigurator().apply(talonFXConfigs);
+        followerMotor.getConfigurator().apply(talonFXConfigs);
+
+        // Make follower motor permanently follow lead motor.
+        followerMotor.setControl(
+                new Follower(
+                    leadMotor.getDeviceID(),
+                    JsonConstants.elevatorConstants.invertFollowerElevatorMotor));
+    }
+    ```
