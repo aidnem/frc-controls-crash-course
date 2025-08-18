@@ -153,7 +153,9 @@ While this guide contains code snippets, it is *strongly encouraged* not to copy
 	There are a few fields we want to track in our inputs:
 
 	- We need some way to measure the current position of the elevator. Our hypothetical elevator has an encoder on the spool, which turns a certain amount every time the elevator moves. For the sake of example, let's say this elevator moves 5 inches per rotation of the spool.
+
 		*(An encoder is a sensor that measures an angle. See the glossary for more details)*
+
 		Because the IO level is only concerned with directly communicating with hardware, the IO will track the position of the elevator in terms of the angle of the encoder:
 		```java
 		/** The angle of the elevator spool encoder */
@@ -180,6 +182,7 @@ While this guide contains code snippets, it is *strongly encouraged* not to copy
 		public MutCurrent elevatorFollowerMotorSupplyCurrent = Amps.mutable(0.0);
 		```
 	- We can also log a few other fields. For instance, the current error and mechanism velocity reported by Motion Magic, and the angle of the motor.
+
 		```java
 		/**
 	     * Current closed-loop error (distance from setpoint position) as reported by the lead motor
@@ -201,6 +204,7 @@ While this guide contains code snippets, it is *strongly encouraged* not to copy
 	  ```
 1. Define your ElevatorOutputs class.
 	This is very similar to the ElevatorInputs class. Most teams don't use a separate Outputs class to log outputs, but since the Inputs class can get quite large and overwhelming. Because this guide is using onboard PID control running on the TalonFX controller itself, our robot code doesn't know the applied voltage to the motors without querying the motor controller for that data. This data is then stored in the ElevatorOutputs class, which is updated whenever applyOutputs is called. We also track the contributions of the P, I, and D terms of the PID controller individually, as this can be helpful for diagnosing the cause of tuning/overshoot issues. Most systems likely won't need these fields, and there's a case to be made for decreasing the number of fields that are logged, as logging 700+ fields can cause AdvantageScope to crash on slower laptops and overwhelm weak WiFi connections.
+
 	*Note: Having an outputs class at all is a bit unconventional, and it's technically a misnomer, as the Outputs object actually contains data that, while related to the output of the motors, is an input of the robot programming. Team 401 may not even use Outputs classes in the 2026 season. If you are greatly offended by the concept, feel free to add the fields from here to ElevatorInputs, and then make the applyOutputs method update the ElevatorInputs object as well.*
 	
 	  ```java
@@ -212,17 +216,17 @@ While this guide contains code snippets, it is *strongly encouraged* not to copy
 		/** The current output mode of the elevator */
 		public ElevatorOutputMode outputMode = ElevatorOutputMode.ClosedLoop;
 	
-		/** The voltage applied to the elevator motor */
-		public MutVoltage elevatorAppliedVolts = Volts.mutable(0.0);
+		/** The voltage/current applied to the elevator motor */
+		public double elevatorAppliedOutput = 0.0;
 	
 		/** Contribution of the p-term to motor output */
-		public MutVoltage pContrib = Volts.mutable(0.0);
+		public double pContrib = 0.0;
 	
 		/** Contribution of the i-term to motor output */
-		public MutVoltage iContrib = Volts.mutable(0.0);
+		public double iContrib = 0.0;
 	
 		/** Contribution of the d-term to motor output */
-		public MutVoltage dContrib = Volts.mutable(0.0);
+		public double dContrib = 0.0;
 	  }	
 	  ```
 
@@ -349,3 +353,88 @@ While this guide contains code snippets, it is *strongly encouraged* not to copy
                     JsonConstants.elevatorConstants.invertFollowerElevatorMotor));
     }
     ```
+
+	For more information on how to interact with the TalonFX from your robot code, check out the [Phoenix 6 API docs](https://v6.docs.ctr-electronics.com/en/stable/docs/api-reference/api-usage/index.html).
+
+	Now that we can construct an `ElevatorIOTalonFX`, let's add the functionality to update its inputs and apply its outputs.
+
+	The `updateInputs` method takes an `ElevatorInputs` object, which is owned by the `ElevatorSubsystem` (or mechanism) instance, and is passed to the IO. The IO updates the values in the `ElevatorInputs` so that they can be accessed by code at a higher level. By separating all of the input and output data into these objects, we open up the possibility to replay our old logs, by filling the values in `ElevatorInputs` from a log instead of from real life sensor data. More about log replay mode can be found on the [AdvantageKit website](https://docs.advantagekit.org/getting-started/traditional-replay/)
+
+
+	Start by defining the method:
+
+	```java
+	@Override
+	public void updateInputs(ElevatorInputs inputs) {
+	}
+	```
+
+	What this method needs to do is to read data from the TalonFX and CANcoder devices. Phoenix 6 makes this possible through [Status Signals](https://v6.docs.ctr-electronics.com/en/stable/docs/api-reference/api-usage/status-signals.html). A status signal represents some piece of data from a sensor, along with a timestamp, latency, and units. The API includes methods to get the value from a status signal. Let's use these to update the fields of our inputs object:
+
+	```java
+	@Override
+	public void updateInputs(ElevatorInputs inputs) {
+		// We have to use mut_replace instead of =, as reassigning this object will cause the old object ot be manually garbage collected.
+		inputs.encoderPos.mut_replace(elevatorEncoder.getPosition().getValue());
+
+		// We update this value in applyOutputs.
+		inputs.encoderSetpointPos = encoderSetpointPos;
+
+		// getStatus returns a status code from last time the signal was polled.
+		inputs.encoderConnected = elevatorEncoder.getPosition().getStatus().isOK();
+
+		inputs.elevatorLeadMotorStatorCurrent.mut_replace(leadMotor.getStatorCurrent().getValue());
+		inputs.elevatorLeadMotorSupplyCurrent.mut_replace(leadMotor.getSupplyCurrent().getValue());
+
+		inputs.elevatorFollowerMotorStatorCurrent.mut_replace(followerMotor.getStatorCurrent().getValue());
+		inputs.elevatorFollowerMotorSupplyCurrent.mut_replace(followerMotor.getSupplyCurrent().getValue());
+
+		// getValueAsDouble since the units on closed loop error are a little 
+		inputs.motionMagicError = leadMotor.getClosedLoopError().getValueAsDouble();
+
+		inputs.elevatorMechanismVelocity.mut_replace(elevatorEncoder.getVelocity().getValue());
+	}
+	```
+
+
+	Applying outputs is a little bit more complicated: we have to do different behavior depending on the current output mode:
+
+	```java
+	@Override
+	public void applyOutputs(ElevatorOutputs outputs) {
+		outputs.motorsDisabled = motorsDisabled;
+		outputs.outputMode = outputMode;
+
+		// Calling withPosition on a closed-loop request updates its target position.
+		closedLoopRequest.withPosition(encoderGoalAngle);
+
+		if (motorDisabled) {
+			// Calling withOutput updates the voltage requested
+			leadMotor.setControl(voltageOut.withOutput(0.0));
+		} else {
+			switch (outputMode) {
+				case ClosedLoop:
+					// Notice how we only have to set the request for the lead motor; the follower motor is running a follow request that copies the lead motor automatically.
+					leadMotor.setControl(closedLoopRequest);
+
+					// This value is a double, so we update the magnitude of the measure instead of replacing it with a united value
+					encoderSetpointPos.mut_setMagnitude(leadMotor.getClosedLoopReference().getValue());
+
+					outputs.elevatorAppliedOutput = leadMotor.getClosedLoopOutput().getValueAsDouble();
+
+					outputs.pContrib = leadMotor.getClosedLoopProportionalOutput().getValueAsDouble();
+					outputs.iContrib = leadMotor.getClosedLoopIntegratedOutput().getValueAsDouble();
+					outputs.dContrib = leadMotor.getClosedLoopDerivativeOutput().getValueAsDouble();
+					break;
+				case Voltage:
+					leadMotor.setControl(voltageOut.withOutput(overrideVoltage));
+					outputs.elevatorAppliedOutput = overrideVoltage.in(Volts);
+					break;
+				case Current:
+					leadMotor.setControl(currentOut.withOutput(overrideCurrent));
+					outputs.elevatorAppliedOutput = overrideCurrent.in(Amps);
+					break;
+			}
+		}
+	}
+	```
